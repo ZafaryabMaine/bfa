@@ -1,0 +1,16 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:24.01-py3
+
+%files
+    requirements.txt /requirements.txt
+
+%post
+    DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
+        coreutils \
+        python3-pip \
+		curl
+
+    # Install Python packages from requirements.txt
+    pip install -r /requirements_trl.txt
+    
+    echo "Done"
