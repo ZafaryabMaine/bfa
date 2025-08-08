@@ -11,6 +11,6 @@ From: nvcr.io/nvidia/pytorch:24.01-py3
 		curl
 
     # Install Python packages from requirements.txt
-    pip install -r /requirements_trl.txt
+    pip install -r /requirements.txt
     
     echo "Done"

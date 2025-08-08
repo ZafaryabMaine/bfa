@@ -1,0 +1,7 @@
+dataset/*
+model
+log
+git_update.sh
+*.sh
+*.sif
+*.txt
