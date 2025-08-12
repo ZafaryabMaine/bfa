@@ -18,6 +18,8 @@ def replace_linear_with_custom(module: nn.Module) -> nn.Module:
         new_child = child
         if isinstance(child, LINEAR_TYPES):
             new_child = CustomLinear(child.in_features, child.out_features, bias=(child.bias is not None))
+            # Move to the same device as the original layer
+            new_child = new_child.to(child.weight.device)
             with torch.no_grad():
                 new_child.weight.copy_(child.weight)
                 if child.bias is not None:
@@ -31,7 +33,17 @@ def replace_linear_with_custom(module: nn.Module) -> nn.Module:
 
 def load_model_and_tokenizer(model_name: str, num_labels: int | None = None, device: str | torch.device = "cpu"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+    
+    # If num_labels is not provided, try to load without it first
+    if num_labels is None:
+        try:
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        except Exception:
+            # Fallback to a common default for binary classification
+            model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+    
     model.eval()  # no dropout noise
     model.to(device)
     return model, tokenizer

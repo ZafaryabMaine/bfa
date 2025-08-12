@@ -37,19 +37,43 @@ def parse_args():
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model, tok = load_model_and_tokenizer(args.model_name, device=device)
+    
+    print("🔄 Loading dataset...")
+    # Load dataset first to determine number of labels
+    ds, text_col, label_col = load_text_dataset(args.dataset, args.subset, args.split, args.max_examples)
+    
+    # Determine number of labels from the dataset
+    if args.dataset == "glue" and args.subset == "sst2":
+        num_labels = 2  # SST-2 is binary classification
+    elif args.dataset == "yelp_review_full":
+        num_labels = 5  # Yelp reviews are 1-5 stars
+    else:
+        # Auto-detect from dataset
+        unique_labels = set(ds[label_col])
+        num_labels = len(unique_labels)
+    
+    print(f"📊 Dataset loaded: {len(ds)} examples, {num_labels} labels")
+    
+    print("🤖 Loading model...")
+    # Now load model with correct num_labels
+    model, tok = load_model_and_tokenizer(args.model_name, num_labels=num_labels, device=device)
+    
+    print("🔧 Replacing linear layers with custom layers...")
     replace_linear_with_custom(model)
 
-    ds, text_col, label_col = load_text_dataset(args.dataset, args.subset, args.split, args.max_examples)
+    print("📈 Evaluating baseline...")
     dl = make_dataloader(ds, tok, text_col, label_col, batch_size=args.batch_size, device=device)
     eval_fn = batched_eval_fn(model, dl)
 
     base_acc = eval_fn()
-    print(f"Baseline accuracy: {base_acc:.2f}% on {args.dataset}/{args.subset}:{args.split} (n={len(ds)})")
+    if args.dataset == "glue":
+        print(f"✅ Baseline accuracy: {base_acc:.2f}% on {args.dataset}/{args.subset}:{args.split} (n={len(ds)})")
+    else:
+        print(f"✅ Baseline accuracy: {base_acc:.2f}% on {args.dataset}:{args.split} (n={len(ds)})")
 
     # FaR
     if args.far_steps > 0:
+        print(f"\n🎯 Starting FaR ({args.far_steps} steps)...")
         far = FaRManager(fraction_size=args.fraction_size, division_factor=args.division_factor)
         # Use one (or a few) mini-batches to compute grads for each step
         it = iter(dl)
@@ -60,9 +84,9 @@ def main():
                 it = iter(dl)
                 toks, labels = next(it)
             cfg = far.one_far_step(model, toks, labels)
-            print(f"[FaR {step+1}/{args.far_steps}] layer={cfg.layer.unique_id} row={cfg.row} src={cfg.src} clones={cfg.clones}")
+            print(f"  📍 [FaR {step+1}/{args.far_steps}] layer={cfg.layer.unique_id} row={cfg.row} src={cfg.src} clones={cfg.clones}")
             acc = eval_fn()
-            print(f"  ↳ accuracy after FaR step {step+1}: {acc:.2f}%")
+            print(f"     ↳ accuracy: {acc:.2f}% (Δ{acc-base_acc:+.2f}%)")
 
     # BFA
     if args.attack:
