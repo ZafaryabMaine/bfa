@@ -1,7 +1,17 @@
+# Generated/downloaded data
 dataset/*
-model
-log
-git_update.sh
-*.sh
+model/*
+
+# Logs (but keep structure)
+log/*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Large binaries
 *.sif
-*.txt
+
+# Personal scripts (keep templates)
+*_personal.sh
