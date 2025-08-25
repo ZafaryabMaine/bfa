@@ -6,8 +6,8 @@ import torch
 from src.model_utils import load_model_and_tokenizer, replace_linear_with_custom, deep_copy
 from src.data import load_text_dataset, make_dataloader, accuracy, DEFAULT_MODEL
 from src.far import FaRManager
-from src.bfa import attack_until_drop
-from src.eval_utils import batched_eval_fn
+from src.bfa import simple_bit_flip_attack  
+from src.eval_utils import batched_eval_fn, make_eval_fn
 
 
 def parse_args():
@@ -30,6 +30,7 @@ def parse_args():
     p.add_argument("--bit_index", type=int, default=0, help="Which IEEE754 bit to flip (0=sign, 1=exp high...31=mantissa LSB)")
     p.add_argument("--multiply_fallback", type=float, default=None, help="If set, skip real bit flip and multiply by this scalar (e.g. -3)")
     p.add_argument("--target_drop", type=float, default=0.10, help="relative accuracy drop to stop attack")
+    p.add_argument("--load_checkpoint", type=str, default=None, help="Path to a saved .pt checkpoint to load model weights before evaluation/attack")
 
     return p.parse_args()
 
@@ -57,15 +58,39 @@ def main():
     print("🤖 Loading model...")
     # Now load model with correct num_labels
     model, tok = load_model_and_tokenizer(args.model_name, num_labels=num_labels, device=device)
+    # model, tok = load_model_and_tokenizer("./model/attacked_model_glue_sst2_200flips.pt", num_labels=num_labels, device=device)
     
     print("🔧 Replacing linear layers with custom layers...")
     replace_linear_with_custom(model)
 
+    # Optionally load a saved checkpoint (e.g., attacked model) before any evaluation
+    if args.load_checkpoint:
+        print(f"📦 Loading checkpoint from: {args.load_checkpoint}")
+        ckpt = torch.load(args.load_checkpoint, map_location=device)
+        ckpt_num_labels = ckpt.get('num_labels', None)
+        ckpt_model_name = ckpt.get('tokenizer_name', args.model_name)
+        # If checkpoint num_labels differs, rebuild model accordingly
+        if ckpt_num_labels is not None and ckpt_num_labels != num_labels:
+            print(f"⚠️  Checkpoint num_labels={ckpt_num_labels} differs from current={num_labels}. Rebuilding model to match checkpoint.")
+            model, tok = load_model_and_tokenizer(ckpt_model_name, num_labels=ckpt_num_labels, device=device)
+            replace_linear_with_custom(model)
+        model.load_state_dict(ckpt['model_state_dict'], strict=True)
+        print("✅ Checkpoint weights loaded.")
+
     print("📈 Evaluating baseline...")
     dl = make_dataloader(ds, tok, text_col, label_col, batch_size=args.batch_size, device=device)
-    eval_fn = batched_eval_fn(model, dl)
 
-    base_acc = eval_fn()
+    eval_data = []
+    for toks, labels in dl:
+        eval_data.append((toks, labels))
+
+    # Build both eval APIs:
+    # - eval_fn_model(model): preferred, model-arg function over fixed eval_data
+    # - eval_fn(): zero-arg wrapper bound to `model` for simple attack/backcompat
+    eval_fn_model = make_eval_fn(eval_data)
+    eval_fn = lambda: eval_fn_model(model)
+
+    base_acc = eval_fn_model(model)
     if args.dataset == "glue":
         print(f"✅ Baseline accuracy: {base_acc:.2f}% on {args.dataset}/{args.subset}:{args.split} (n={len(ds)})")
     else:
@@ -85,35 +110,52 @@ def main():
                 toks, labels = next(it)
             cfg = far.one_far_step(model, toks, labels)
             print(f"  📍 [FaR {step+1}/{args.far_steps}] layer={cfg.layer.unique_id} row={cfg.row} src={cfg.src} clones={cfg.clones}")
-            acc = eval_fn()
+            acc = eval_fn_model(model)
             print(f"     ↳ accuracy: {acc:.2f}% (Δ{acc-base_acc:+.2f}%)")
 
-    # BFA
+        # BFA
     if args.attack:
-        attacker_view = deep_copy(model) if not args.black_box else deep_copy(model).cpu()
-        # If black-box, attacker should see the *pre-FaR* model. We didn't save it, so
-        # the simple way is to reload a fresh model and patch linears the same way:
-        if args.black_box:
-            pre_model, _ = load_model_and_tokenizer(args.model_name, device=device)
-            replace_linear_with_custom(pre_model)
-            attacker_view = pre_model
-            print("Attacker uses a black-box view (no FaR).")
-        else:
-            print("Attacker uses white-box view (sees FaR-modified gradients).")
+        print(f"\n🎯 Starting BFA attack...")
 
-        # Use the *first* batch for attacker gradient ranking (like PBS attacks)
-        toks, labels = next(iter(dl))
-        flips, final_acc = attack_until_drop(
+        # We use the fixed-data evaluation function (zero-arg) so pre/post use the exact same data
+        # No attacker_view, no gradients, no device juggling needed for simple bit flips
+        print(f"🔍 DEBUG: Starting simple bit flip attack...")
+        flips, final_acc = simple_bit_flip_attack(
             victim=model,
-            attacker_view=attacker_view,
-            toks=toks,
-            labels=labels,
-            eval_fn=eval_fn,
+            eval_fn_model=eval_fn_model,  # model-arg eval fn for unambiguous post-flip eval
             target_rel_drop=args.target_drop,
             bit_index=args.bit_index,
-            multiply_fallback=args.multiply_fallback,
+            max_flips=200,
         )
-        print(f"BFA complete after {flips} flips → final accuracy: {final_acc:.2f}% (target drop={args.target_drop*100:.0f}%)")
+        print(f"💥 BFA complete after {flips} flips → final accuracy: {final_acc:.2f}% (target drop={args.target_drop*100:.0f}%)")
+
+        # Evaluate post-attack accuracy on the SAME fixed dataset
+        print("📊 Evaluating post-attack accuracy on same dataset...")
+        post_attack_acc = eval_fn_model(model)  # model is now attacked in-place
+        accuracy_drop = base_acc - post_attack_acc
+        print(f"📉 Post-attack accuracy: {post_attack_acc:.2f}% (drop: {accuracy_drop:.2f}%)")
+        print(f"📋 Comparison: {base_acc:.2f}% → {post_attack_acc:.2f}% (same {len(ds)} examples)")
+
+        # Save the attacked model
+        import os
+        os.makedirs("model", exist_ok=True)
+        model_save_path = f"model/attacked_model_{args.dataset}_{args.subset if args.dataset == 'glue' else 'full'}_{flips}flips.pt"
+        torch.save({
+            'model_state_dict': model.state_dict(),  # This now contains the attacked weights
+            'tokenizer_name': args.model_name,
+            'num_labels': num_labels,
+            'baseline_accuracy': base_acc,
+            'post_attack_accuracy': post_attack_acc,
+            'accuracy_drop': accuracy_drop,
+            'num_flips': flips,
+            'bit_index': args.bit_index,
+            'far_steps': args.far_steps,
+            'dataset': args.dataset,
+            'subset': args.subset if args.dataset == 'glue' else None,
+            'split': args.split,
+            'max_examples': args.max_examples
+        }, model_save_path)
+        print(f"💾 Attacked model saved to: {model_save_path}")
 
 
 if __name__ == "__main__":
